@@ -1,2 +1,10 @@
 Flask>=2.0
 python-multipart>=0.0.5
+requests
+beautifulsoup4
+pdfplumber
+Pillow
+python-docx
+pandas
+openpyxl
+pyyaml
