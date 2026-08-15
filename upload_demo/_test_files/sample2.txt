@@ -1,0 +1,2 @@
+Another sample file with some repeated words: apple apple apple banana.
+Another sample file with some repeated words: apple apple apple banana.
