@@ -19,6 +19,22 @@
 
   <div id="results" class="results-grid"></div>
 
+  <!-- Global graph mode controls -->
+  <div id="graph-controls" style="margin:12px 0;display:flex;gap:8px;align-items:center;">
+    <label style="font-weight:600;">Graph Mode:</label>
+    <select id="graph-mode-select">
+      <option value="structural">Structural</option>
+      <option value="heatmap">Heatmap</option>
+      <option value="ego">Ego</option>
+      <option value="semantic">Semantic</option>
+      <option value="temporal">Temporal</option>
+    </select>
+    <label id="anchor-label" style="margin-left:8px;display:none">Anchor:</label>
+    <select id="anchor-select" style="display:none"></select>
+    <button id="apply-mode" style="margin-left:6px;">Apply</button>
+    <span id="mode-help" style="margin-left:12px;color:#444;font-size:13px">Choose a mode and press Apply to update visible graphs.</span>
+  </div>
+
   <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
   <script src="https://d3js.org/d3.v7.min.js"></script>
   <script src="static/visualize.js"></script>
@@ -46,6 +62,35 @@ function topWords(text, n=10){
   const counts = {};
   for(const w of words){counts[w]= (counts[w]||0)+1}
   return Object.entries(counts).sort((a,b)=>b[1]-a[1]).slice(0,n).map(x=>({word:x[0],count:x[1]}));
+}
+
+// Local fallback processor for when server returns unsupported format or empty parse
+async function localProcessFile(file, card, canvas, graphDiv, semanticsPre){
+  const preview = card.querySelector('.preview');
+  if(file.type && file.type.startsWith('text/') || /\.(txt|md|json|csv|xml)$/i.test(file.name)){
+    const text = await file.text();
+    preview.textContent = text.slice(0,2000);
+    const top = topWords(text,12);
+    const words = (text||'').toLowerCase().match(/[a-z0-9]+/g)||[];
+    const counts = {}; for(const w of words){ if(!['the','and','is','in','it','to','of','a'].includes(w)) counts[w]=(counts[w]||0)+1 }
+    const topWords = Object.entries(counts).sort((a,b)=>b[1]-a[1]).slice(0,12).map(x=>x[0]);
+    const nodes = topWords.map(w=>({id:w,label:w,size:Math.max(5,counts[w]||1)}));
+    const edges = [];
+    for(let i=0;i<words.length;i++){ const w=words[i]; if(!topWords.includes(w)) continue; for(let j=i+1;j<Math.min(words.length,i+4);j++){ const v=words[j]; if(topWords.includes(v)&&v!==w){ edges.push({source:w,target:v,weight:1}); }}}
+    semanticsPre.textContent = JSON.stringify({name:file.name,size:file.size,type:file.type,topWords:top,graph:{nodes,edges}},null,2);
+    try{ renderBarChart(canvas, top.map(x=>({word:x.word||x[0],count:x.count||x[1]}))); }catch(e){}
+    try{ graphDiv._nodes = nodes; graphDiv._edges = edges; renderGraph(graphDiv, nodes, edges); }catch(e){}
+  } else if(file.type && file.type.startsWith('image/')){
+    const data = await new Promise((res,rej)=>{ const r=new FileReader(); r.onload=()=>res(r.result); r.onerror=rej; r.readAsDataURL(file); });
+    const img = document.createElement('img'); img.src = data; preview.appendChild(img);
+    semanticsPre.textContent = JSON.stringify({name:file.name,size:file.size,type:file.type,preview:'image data URL'},null,2);
+  } else {
+    const ab = await file.arrayBuffer();
+    const bytes = new Uint8Array(ab).slice(0,256);
+    const hex = Array.from(bytes).map(b=>b.toString(16).padStart(2,'0')).join(' ');
+    preview.textContent = hex;
+    semanticsPre.textContent = JSON.stringify({name:file.name,size:file.size,type:file.type,hexPreview:hex.split(' ').slice(0,48).join(' ')},null,2);
+  }
 }
 
 input.addEventListener('change', async (e)=>{
@@ -81,7 +126,16 @@ input.addEventListener('change', async (e)=>{
       // Render top words chart
       try{ renderBarChart(canvas, r.top_words || []); } catch(e){ console.warn(e); }
       // Render graph with D3
-      try{ renderGraph(graphDiv, r.graph.nodes || [], r.graph.edges || []); } catch(e){ console.warn(e); }
+      try{ 
+        const nodes = (r.graph && r.graph.nodes) || [];
+        const edges = (r.graph && r.graph.edges) || [];
+        if(nodes.length && edges.length){ graphDiv._nodes = nodes; graphDiv._edges = edges; renderGraph(graphDiv, nodes, edges); }
+        else {
+          // server returned no usable graph — try local fallback using selectedFiles
+          const local = (selectedFiles || []).find(f=>f.name === r.filename);
+          if(local){ const semanticsPre = document.createElement('pre'); semanticsPre.style.whiteSpace='pre-wrap'; card.appendChild(semanticsPre); await localProcessFile(local, card, canvas, graphDiv, semanticsPre); }
+        }
+      } catch(e){ console.warn(e); }
 
       // Raw parsed JSON download
       const semanticsPre = document.createElement('pre'); semanticsPre.style.whiteSpace='pre-wrap'; semanticsPre.textContent = JSON.stringify(r.parsed, null, 2);
@@ -92,7 +146,9 @@ input.addEventListener('change', async (e)=>{
       card.appendChild(downloadBtn);
       results.appendChild(card);
     }
-    return;
+      // populate anchors for global mode controls
+      try{ populateAnchors(); }catch(e){}
+      return;
   } catch (err) {
     console.warn('Server processing failed, falling back to local:', err);
     notice.textContent = 'Server unreachable — using client-side processing.';
@@ -138,7 +194,7 @@ input.addEventListener('change', async (e)=>{
       const graphDiv = document.createElement('div'); graphDiv.className='graph'; viz.appendChild(graphDiv);
       card.appendChild(viz);
       try{ renderBarChart(canvas, top.map(x=>({word:x.word||x[0],count:x.count||x[1]}))); }catch(e){}
-      try{ renderGraph(graphDiv, graph.nodes, graph.edges); }catch(e){}
+      try{ graphDiv._nodes = graph.nodes; graphDiv._edges = graph.edges; renderGraph(graphDiv, graphDiv._nodes, graphDiv._edges); }catch(e){}
     } else if(file.type && file.type.startsWith('image/')){
       const data = await new Promise((res,rej)=>{ const r=new FileReader(); r.onload=()=>res(r.result); r.onerror=rej; r.readAsDataURL(file); });
       const img = document.createElement('img'); img.src = data; preview.appendChild(img);
@@ -164,6 +220,37 @@ input.addEventListener('change', async (e)=>{
     card.appendChild(downloadBtn);
     results.appendChild(card);
   }
+  try{ populateAnchors(); }catch(e){}
+});
+
+// Graph mode control wiring
+const modeSelect = document.getElementById('graph-mode-select');
+const anchorSelect = document.getElementById('anchor-select');
+const anchorLabel = document.getElementById('anchor-label');
+const applyBtn = document.getElementById('apply-mode');
+
+function populateAnchors(){
+  const graphs = document.querySelectorAll('.graph');
+  const ids = new Set();
+  graphs.forEach(g=>{ const nodes = g._nodes||[]; nodes.forEach(n=>ids.add(n.id)); });
+  anchorSelect.innerHTML = '';
+  ids.forEach(id=>{ const o = document.createElement('option'); o.value = id; o.textContent = id; anchorSelect.appendChild(o); });
+  anchorLabel.style.display = ids.size ? 'inline-block' : 'none';
+  anchorSelect.style.display = ids.size ? 'inline-block' : 'none';
+}
+
+modeSelect.addEventListener('change', ()=>{
+  if(modeSelect.value==='ego'){
+    populateAnchors();
+  } else {
+    anchorLabel.style.display='none'; anchorSelect.style.display='none';
+  }
+});
+
+applyBtn.addEventListener('click', ()=>{
+  const mode = modeSelect.value;
+  const anchor = (mode==='ego' && anchorSelect.value) ? anchorSelect.value : null;
+  document.querySelectorAll('.graph').forEach(g=>{ try{ renderGraph(g, g._nodes||[], g._edges||[], mode, anchor); }catch(e){ console.warn(e); } });
 });
   </script>
 
