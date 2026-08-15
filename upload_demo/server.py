@@ -6,6 +6,7 @@ import re
 from pathlib import Path
 from collections import Counter, defaultdict
 from flask import Flask, request, jsonify, send_from_directory
+import numpy as np
 
 # Make the repo root importable so we can `import semantica` from the local clone
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -119,6 +120,101 @@ def upload():
             for k in ('entities', 'relations', 'topics'):
                 if k in parsed:
                     extra[k] = parsed[k]
+
+        # Semantic grouping and temporal extraction using semantica embedder if available
+        try:
+            from semantica.embeddings.text_embedder import TextEmbedder
+
+            embedder = TextEmbedder()
+            # split text into sentences for semantic grouping
+            sentences = re.split(r"(?<=[.!?])\\s+", text.strip()) if text else []
+            sentence_embeddings = []
+            if sentences:
+                try:
+                    sentence_embeddings = embedder.embed_sentences(text)
+                except Exception:
+                    # fallback: embed sentences individually
+                    sent_texts = [s for s in sentences if s.strip()]
+                    if sent_texts:
+                        arr = embedder.embed_batch(sent_texts)
+                        sentence_embeddings = [arr[i] for i in range(len(arr))]
+
+            semantic_groups = []
+            node_group = {}
+            temporal = {}
+
+            if sentence_embeddings:
+                # convert to numpy array
+                X = np.vstack([np.array(v) for v in sentence_embeddings])
+                n = X.shape[0]
+                used = [False] * n
+                groups = []
+                # greedy clustering by cosine similarity
+                for i in range(n):
+                    if used[i]:
+                        continue
+                    used[i] = True
+                    members = [i]
+                    centroid = X[i].copy()
+                    for j in range(i+1, n):
+                        if used[j]:
+                            continue
+                        sim = float(np.dot(centroid, X[j]) / ((np.linalg.norm(centroid) * np.linalg.norm(X[j])) + 1e-12))
+                        if sim > 0.72:
+                            used[j] = True
+                            members.append(j)
+                            centroid += X[j]
+                    groups.append(members)
+
+                # build semantic group labels
+                for gi, members in enumerate(groups):
+                    combined = ' '.join([sentences[m] for m in members])
+                    tops = top_words(combined, n=3)
+                    label = ' '.join([w for w, _ in tops]) or f'group_{gi}'
+                    semantic_groups.append({'id': f'grp{gi}', 'label': label, 'members': members})
+
+                # map graph nodes (top words) to semantic groups by occurrence in member sentences
+                for node in graph.get('nodes', []):
+                    word = node.get('label')
+                    best_g = None
+                    best_count = 0
+                    for gi, members in enumerate(groups):
+                        cnt = 0
+                        for m in members:
+                            if re.search(rf"\\b{re.escape(word)}\\b", sentences[m], flags=re.I):
+                                cnt += 1
+                        if cnt > best_count:
+                            best_count = cnt
+                            best_g = gi
+                    if best_g is not None and best_count > 0:
+                        node_group[node.get('id')] = f'grp{best_g}'
+
+            # temporal: find years in sentences and aggregate
+            years = Counter()
+            sentence_years = {}
+            if text:
+                for idx, s in enumerate(re.split(r"(?<=[.!?])\\s+", text.strip())):
+                    yrs = re.findall(r"\\b(19|20)\\d{2}\\b", s)
+                    # yrs returns list of '19'/'20' prefixes due to grouping; instead find full years
+                    yrs_full = re.findall(r"\\b(19\\d{2}|20\\d{2})\\b", s)
+                    if yrs_full:
+                        for y in yrs_full:
+                            years[y] += 1
+                        sentence_years[idx] = yrs_full
+                temporal = {'years': dict(years), 'sentence_years': sentence_years}
+
+            if semantic_groups:
+                extra['semantic'] = semantic_groups
+            if node_group:
+                extra['node_group'] = node_group
+            if temporal:
+                extra['temporal'] = temporal
+        except Exception as e:
+            # embedding/model not available or failed; skip semantic features
+            try:
+                extra['semantic_error'] = str(e)
+            except Exception:
+                extra['semantic_error'] = repr(e)
 
         results.append({
             'filename': safe_name,
